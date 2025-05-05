@@ -26,8 +26,12 @@ def add_cors_headers(response):
 
 # Initialize Firebase - with error handling
 try:
-    cred_path = os.path.join(os.path.dirname(__file__), 'serviceAccountKey.json')
-    cred = credentials.Certificate(cred_path)
+    if 'FIREBASE_CONFIG' in os.environ:
+        firebase_config = json.loads(os.environ.get('FIREBASE_CONFIG'))
+        cred = credentials.Certificate(firebase_config)
+    else:
+        cred_path = os.path.join(os.path.dirname(__file__), 'serviceAccountKey.json')
+        cred = credentials.Certificate(cred_path)
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://theelefit-3f6c6-default-rtdb.firebaseio.com/'
     })
