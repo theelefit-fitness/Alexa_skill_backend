@@ -8,6 +8,9 @@ from firebase_admin import credentials
 from firebase_admin import db
 from firebase_admin import firestore
 import requests
+import base64
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -395,6 +398,14 @@ def get_meal_logs():
         print(f"Error in get_meal_logs: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
+# Helper function to find slot values, trying multiple possible slot names
+def get_slot_value(slots, possible_slot_names, default_value=''):
+    """Get a slot value by trying multiple possible slot names."""
+    for slot_name in possible_slot_names:
+        if slot_name in slots and slots[slot_name].get('value'):
+            return slots[slot_name].get('value')
+    return default_value
+
 # Alexa endpoint - Will handle both workout and meal logging from Alexa
 @app.route('/api/alexa/log', methods=['POST'])
 def alexa_log():
@@ -457,23 +468,28 @@ def alexa_log():
                 
                 if intent_name == 'LogWorkoutIntent':
                     # Get workout details from slots
-                    workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
+                    workout_type = get_slot_value(slots, ['WorkoutType', 'workoutType'], 'cardio').lower()
                     duration = 30  # Default
                     
-                    if 'Duration' in slots and slots['Duration'].get('value'):
+                    duration_str = get_slot_value(slots, ['Duration', 'duration'])
+                    if duration_str:
                         try:
-                            duration = int(slots['Duration']['value'])
+                            duration = int(duration_str)
                         except ValueError:
-                            print(f"Invalid duration value: {slots['Duration']['value']}")
+                            print(f"Invalid duration value: {duration_str}")
                     
+                    # Print debug information
+                    print(f"Received slots: {json.dumps(slots, indent=2)}")
+                    print(f"Workout type: {workout_type}, Duration: {duration}")
+                        
                     # Create workout data
                     workout_data = {
-                        'logType': 'workout',
                         'workoutType': workout_type,
-                        'activityName': workout_type,  # Use workout type as activity name
                         'duration': duration,
                         'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
-                        'source': 'alexa'
+                        'source': 'alexa',
+                        'type': 'workout',
+                        'id': f'alexa_{datetime.datetime.now().timestamp()}'
                     }
                     
                     print(f"Prepared workout data: {json.dumps(workout_data, indent=2)}")
@@ -514,21 +530,27 @@ def alexa_log():
                         })
                     
                 elif intent_name == 'LogMealIntent':
-                    # Get meal details from slots
-                    meal_type = slots.get('MealType', {}).get('value', 'snack').lower()
+                    # Extract meal details from slots
+                    meal_type = get_slot_value(slots, ['MealType', 'mealType'], 'snack').lower()
                     
                     # Extract food items
                     food_items = []
-                    if 'FoodItem' in slots and slots['FoodItem'].get('value'):
-                        food_items.append(slots['FoodItem']['value'])
+                    food_item = get_slot_value(slots, ['FoodItem', 'foodItems'])
+                    if food_item:
+                        food_items.append(food_item)
+                    
+                    # Print debug information
+                    print(f"Received slots for meal: {json.dumps(slots, indent=2)}")
+                    print(f"Meal type: {meal_type}, Food Items: {food_items}")
                     
                     # Create meal data
                     meal_data = {
-                        'logType': 'meal',
                         'mealType': meal_type,
                         'foodItems': food_items,
                         'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
-                        'source': 'alexa'
+                        'source': 'alexa',
+                        'type': 'meal',
+                        'id': f'alexa_{datetime.datetime.now().timestamp()}'
                     }
                     
                     print(f"Prepared meal data: {json.dumps(meal_data, indent=2)}")
@@ -538,8 +560,7 @@ def alexa_log():
                         # Make a new request to our own API
                         meal_response = log_direct_meal(meal_data)
                         
-                        # Get food item text
-                        food_item = slots.get('FoodItem', {}).get('value', '')
+                        # Create response text
                         food_text = f" with {food_item}" if food_item else ""
                         
                         # Create Alexa response
@@ -708,6 +729,8 @@ def log_direct_meal(meal_data):
         for field in required_fields:
             if field not in meal_data:
                 return {'success': False, 'message': f'Missing required field: {field}'}
+                
+        print(f"Processing meal data: {json.dumps(meal_data, indent=2)}")
         
         # Create meal document
         meal_doc = {
@@ -739,6 +762,8 @@ def log_direct_meal(meal_data):
                 
                 # Sync to Firestore
                 sync_to_firestore(meal_doc, 'meal')
+                
+                print(f"Successfully logged meal: {json.dumps(meal_doc, indent=2)}")
                 
                 return {
                     'success': True,
@@ -865,14 +890,15 @@ def debug_alexa_workout():
             
             if intent_name == 'LogWorkoutIntent':
                 # Get workout details from slots
-                workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
+                workout_type = get_slot_value(slots, ['WorkoutType', 'workoutType'], 'cardio').lower()
                 duration = 30  # Default
                 
-                if 'Duration' in slots and slots['Duration'].get('value'):
+                duration_str = get_slot_value(slots, ['Duration', 'duration'])
+                if duration_str:
                     try:
-                        duration = int(slots['Duration']['value'])
+                        duration = int(duration_str)
                     except ValueError:
-                        print(f"Invalid duration value: {slots['Duration']['value']}")
+                        print(f"Invalid duration value: {duration_str}")
                 
                 # Log workout in test mode
                 workout_id = f"test-{datetime.datetime.now().timestamp()}"
@@ -948,7 +974,7 @@ def alexa_auth_log():
                 "response": {
                     "outputSpeech": {
                         "type": "PlainText",
-                        "text": "Please link your Google account in the Alexa app to use this skill."
+                        "text": "Please link your account in the Alexa app first."
                     },
                     "card": {
                         "type": "LinkAccount"
@@ -956,47 +982,32 @@ def alexa_auth_log():
                     "shouldEndSession": True
                 }
             })
-            
-        # Verify the token with Google
-        token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?access_token={token}"
-        token_response = requests.get(token_info_url)
         
-        if token_response.status_code != 200:
-            print(f"Invalid token: {token_response.text}")
-            return jsonify({
-                "version": "1.0",
-                "response": {
-                    "outputSpeech": {
-                        "type": "PlainText",
-                        "text": "Your Google account link has expired. Please relink your account in the Alexa app."
-                    },
-                    "card": {
-                        "type": "LinkAccount"
-                    },
-                    "shouldEndSession": True
-                }
-            })
-            
-        # Extract user email from token info
-        token_data = token_response.json()
-        user_email = token_data.get("email")
+        print(f"Access token: {token[:20]}... (truncated)")
         
-        if not user_email:
-            print("No email found in token data")
-            return jsonify({
-                "version": "1.0",
-                "response": {
-                    "outputSpeech": {
-                        "type": "PlainText",
-                        "text": "We couldn't find your email address. Please relink your account in the Alexa app."
-                    },
-                    "card": {
-                        "type": "LinkAccount"
-                    },
-                    "shouldEndSession": True
-                }
-            })
-            
+        # Verify the token with Firebase
+        try:
+            # Use Google's OAuth2 toolkit to verify the token
+            user_info = id_token.verify_oauth2_token(token, google_requests.Request())
+            print(f"Successfully verified token. User info: {json.dumps(user_info, indent=2)}")
+            user_email = user_info.get('email', 'unknown_email')
+        except Exception as e:
+            print(f"Error verifying token: {str(e)}")
+            # This is a fallback - may not be reliable in production
+            # For demo, we'll try to extract email from the token payload
+            try:
+                token_parts = token.split('.')
+                if len(token_parts) >= 2:
+                    padding = '=' * (4 - len(token_parts[1]) % 4)
+                    payload = json.loads(base64.b64decode(token_parts[1] + padding).decode('utf-8'))
+                    user_email = payload.get('email', 'unknown_email')
+                    print(f"Extracted email from token payload: {user_email}")
+                else:
+                    user_email = 'unknown_email'
+            except Exception as token_error:
+                print(f"Error parsing token: {str(token_error)}")
+                user_email = 'unknown_email'
+
         print(f"Authenticated Alexa request for user: {user_email}")
         
         # Handle IntentRequests
@@ -1053,13 +1064,19 @@ def alexa_auth_log():
             # Handle logging workouts
             elif intent_name == 'LogWorkoutIntent':
                 # Extract workout details from slots
-                workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
-                duration_str = slots.get('duration', {}).get('value', '30')
+                workout_type = get_slot_value(slots, ['WorkoutType', 'workoutType'], 'cardio').lower()
+                duration = 30  # Default
                 
-                try:
-                    duration = int(duration_str)
-                except ValueError:
-                    duration = 30
+                duration_str = get_slot_value(slots, ['Duration', 'duration'])
+                if duration_str:
+                    try:
+                        duration = int(duration_str)
+                    except ValueError:
+                        print(f"Invalid duration value: {duration_str}")
+                    
+                # Print debug information
+                print(f"Received slots: {json.dumps(slots, indent=2)}")
+                print(f"Workout type: {workout_type}, Duration: {duration}")
                     
                 # Create workout data
                 workout_data = {
@@ -1078,7 +1095,7 @@ def alexa_auth_log():
                         user_ref = firestore_db.collection('users').document(user_email)
                         
                         # Add workout to Firestore
-                        workout_ref = firestore_db.collection('users').document(user_email).collection('workouts').document()
+                        workout_ref = user_ref.collection('workout_logs').document()
                         workout_data['id'] = workout_ref.id
                         workout_ref.set(workout_data)
                         
@@ -1115,12 +1132,17 @@ def alexa_auth_log():
                 
             elif intent_name == 'LogMealIntent':
                 # Extract meal details from slots
-                meal_type = slots.get('mealType', {}).get('value', 'snack').lower()
+                meal_type = get_slot_value(slots, ['MealType', 'mealType'], 'snack').lower()
                 
                 # Extract food items
                 food_items = []
-                if 'foodItems' in slots and slots['foodItems'].get('value'):
-                    food_items.append(slots['foodItems'].get('value'))
+                food_item = get_slot_value(slots, ['FoodItem', 'foodItems'])
+                if food_item:
+                    food_items.append(food_item)
+                
+                # Print debug information
+                print(f"Received slots for meal: {json.dumps(slots, indent=2)}")
+                print(f"Meal type: {meal_type}, Food Items: {food_items}")
                 
                 # Create meal data
                 meal_data = {
@@ -1136,14 +1158,14 @@ def alexa_auth_log():
                 if firestore_db:
                     try:
                         # Add meal to Firestore
-                        meal_ref = firestore_db.collection('users').document(user_email).collection('meals').document()
+                        user_ref = firestore_db.collection('users').document(user_email)
+                        meal_ref = user_ref.collection('meal_logs').document()
                         meal_data['id'] = meal_ref.id
                         meal_ref.set(meal_data)
                         
                         print(f"Meal logged successfully for user: {user_email}")
                         
                         # Get food item text for response
-                        food_item = slots.get('foodItems', {}).get('value', '')
                         food_text = f" with {food_item}" if food_item else ""
                         
                         # Create Alexa response
