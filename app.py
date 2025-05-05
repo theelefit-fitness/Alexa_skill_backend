@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, make_response
 from flask_cors import CORS
 import os
 import json
@@ -457,7 +457,7 @@ def alexa_log():
                 
                 if intent_name == 'LogWorkoutIntent':
                     # Get workout details from slots
-                    workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
+                    workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
                     duration = 30  # Default
                     
                     if 'Duration' in slots and slots['Duration'].get('value'):
@@ -865,7 +865,7 @@ def debug_alexa_workout():
             
             if intent_name == 'LogWorkoutIntent':
                 # Get workout details from slots
-                workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
+                workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
                 duration = 30  # Default
                 
                 if 'Duration' in slots and slots['Duration'].get('value'):
@@ -929,47 +929,18 @@ def debug_alexa_workout():
 def alexa_auth_log():
     """Handle logging from Alexa with user authentication via Google OAuth."""
     try:
-        # Get the request data
+        # Parse the incoming request from Alexa
         request_data = request.json
-        print(f"Received Alexa request: {json.dumps(request_data, indent=2)}")
+        print(f"Received Alexa auth request: {json.dumps(request_data, indent=2)}")
         
-        # Handle LaunchRequest first (when skill is opened)
-        if request_data.get('request', {}).get('type') == 'LaunchRequest':
-            print("Handling LaunchRequest")
-            return jsonify({
-                "version": "1.0",
-                "response": {
-                    "outputSpeech": {
-                        "type": "PlainText",
-                        "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
-                    },
-                    "reprompt": {
-                        "outputSpeech": {
-                            "type": "PlainText",
-                            "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
-                        }
-                    },
-                    "shouldEndSession": False
-                }
-            })
+        # Extract the access token from the request
+        context = request_data.get('context', {})
+        system = context.get('System', {})
+        user = system.get('user', {})
         
-        # Handle SessionEndedRequest
-        elif request_data.get('request', {}).get('type') == 'SessionEndedRequest':
-            print("Handling SessionEndedRequest")
-            return jsonify({
-                "version": "1.0",
-                "response": {
-                    "outputSpeech": {
-                        "type": "PlainText",
-                        "text": "Goodbye!"
-                    },
-                    "shouldEndSession": True
-                }
-            })
+        # Get the access token
+        token = user.get('accessToken')
         
-        # For other request types, we need authentication
-        # Get the authentication token from the request headers
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
         if not token:
             print("Missing authorization token")
             return jsonify({
@@ -1037,21 +1008,62 @@ def alexa_auth_log():
             
             print(f"Processing intent: {intent_name}")
             
-            if intent_name == 'LogWorkoutIntent':
+            # Launch the skill
+            if intent_name == 'AMAZON.LaunchIntent':
+                print("Handling LaunchIntent")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": f"Welcome to EleFit Tracker. You can say 'log a workout' or 'log a meal'."
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+                
+            # Help intent
+            elif intent_name == 'AMAZON.HelpIntent':
+                print("Handling HelpIntent")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "You can say 'log a workout' to record exercise, or 'log a meal' to record what you ate. How can I help you?"
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+                
+            # Stop or cancel intent
+            elif intent_name in ['AMAZON.StopIntent', 'AMAZON.CancelIntent']:
+                print("Handling StopIntent or CancelIntent")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Goodbye!"
+                        },
+                        "shouldEndSession": True
+                    }
+                })
+                
+            # Handle logging workouts
+            elif intent_name == 'LogWorkoutIntent':
                 # Extract workout details from slots
-                workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
-                duration = 30  # Default
+                workout_type = slots.get('workoutType', {}).get('value', 'cardio').lower()
+                duration_str = slots.get('duration', {}).get('value', '30')
                 
-                if 'Duration' in slots and slots['Duration'].get('value'):
-                    try:
-                        duration = int(slots['Duration']['value'])
-                    except ValueError:
-                        print(f"Invalid duration value: {slots['Duration']['value']}")
-                
+                try:
+                    duration = int(duration_str)
+                except ValueError:
+                    duration = 30
+                    
                 # Create workout data
                 workout_data = {
                     'workoutType': workout_type,
-                    'activityName': workout_type,
                     'duration': duration,
                     'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
                     'source': 'alexa',
@@ -1064,31 +1076,21 @@ def alexa_auth_log():
                     try:
                         # Get user document
                         user_ref = firestore_db.collection('users').document(user_email)
-                        user_doc = user_ref.get()
                         
-                        if user_doc.exists:
-                            # Update workout logs array
-                            workout_logs = user_doc.get('workoutLogs', [])
-                            workout_logs.append(workout_data)
-                            user_ref.update({
-                                'workoutLogs': workout_logs
-                            })
-                        else:
-                            # Create new user document
-                            user_ref.set({
-                                'workoutLogs': [workout_data],
-                                'mealLogs': []
-                            })
-                            
+                        # Add workout to Firestore
+                        workout_ref = firestore_db.collection('users').document(user_email).collection('workouts').document()
+                        workout_data['id'] = workout_ref.id
+                        workout_ref.set(workout_data)
+                        
                         print(f"Workout logged successfully for user: {user_email}")
                         
-                        # Return success response to Alexa
+                        # Create Alexa response
                         return jsonify({
                             "version": "1.0",
                             "response": {
                                 "outputSpeech": {
                                     "type": "PlainText",
-                                    "text": f"Your {workout_type} workout has been logged successfully for {duration} minutes."
+                                    "text": f"Your {workout_type} workout for {duration} minutes has been logged successfully."
                                 },
                                 "card": {
                                     "type": "Simple",
@@ -1113,12 +1115,12 @@ def alexa_auth_log():
                 
             elif intent_name == 'LogMealIntent':
                 # Extract meal details from slots
-                meal_type = slots.get('MealType', {}).get('value', 'snack').lower()
+                meal_type = slots.get('mealType', {}).get('value', 'snack').lower()
                 
                 # Extract food items
                 food_items = []
-                if 'FoodItem' in slots and slots['FoodItem'].get('value'):
-                    food_items.append(slots['FoodItem']['value'])
+                if 'foodItems' in slots and slots['foodItems'].get('value'):
+                    food_items.append(slots['foodItems'].get('value'))
                 
                 # Create meal data
                 meal_data = {
@@ -1133,31 +1135,18 @@ def alexa_auth_log():
                 # Store directly to Firestore for the authenticated user
                 if firestore_db:
                     try:
-                        # Get user document
-                        user_ref = firestore_db.collection('users').document(user_email)
-                        user_doc = user_ref.get()
+                        # Add meal to Firestore
+                        meal_ref = firestore_db.collection('users').document(user_email).collection('meals').document()
+                        meal_data['id'] = meal_ref.id
+                        meal_ref.set(meal_data)
                         
-                        if user_doc.exists:
-                            # Update meal logs array
-                            meal_logs = user_doc.get('mealLogs', [])
-                            meal_logs.append(meal_data)
-                            user_ref.update({
-                                'mealLogs': meal_logs
-                            })
-                        else:
-                            # Create new user document
-                            user_ref.set({
-                                'workoutLogs': [],
-                                'mealLogs': [meal_data]
-                            })
-                            
                         print(f"Meal logged successfully for user: {user_email}")
                         
                         # Get food item text for response
-                        food_item = slots.get('FoodItem', {}).get('value', '')
+                        food_item = slots.get('foodItems', {}).get('value', '')
                         food_text = f" with {food_item}" if food_item else ""
                         
-                        # Return success response to Alexa
+                        # Create Alexa response
                         return jsonify({
                             "version": "1.0",
                             "response": {
@@ -1185,70 +1174,73 @@ def alexa_auth_log():
                                 "shouldEndSession": True
                             }
                         })
-            elif intent_name == 'AMAZON.HelpIntent':
-                return jsonify({
-                    "version": "1.0",
-                    "response": {
-                        "outputSpeech": {
-                            "type": "PlainText",
-                            "text": "You can use EleFit Tracker to log your workouts and meals. Try saying 'log a running workout for 30 minutes' or 'log breakfast with eggs'."
-                        },
-                        "reprompt": {
+                else:
+                    print("Firestore not initialized")
+                    return jsonify({
+                        "version": "1.0",
+                        "response": {
                             "outputSpeech": {
                                 "type": "PlainText",
-                                "text": "What would you like to log?"
-                            }
-                        },
-                        "shouldEndSession": False
-                    }
-                })
-            elif intent_name in ['AMAZON.StopIntent', 'AMAZON.CancelIntent']:
-                return jsonify({
-                    "version": "1.0",
-                    "response": {
-                        "outputSpeech": {
-                            "type": "PlainText",
-                            "text": "Goodbye!"
-                        },
-                        "shouldEndSession": True
-                    }
-                })
+                                "text": "Sorry, the database is not available right now. Please try again later."
+                            },
+                            "shouldEndSession": True
+                        }
+                    })
+            
+            # Unknown intent
             else:
-                # Handle unknown intent
                 print(f"Unknown intent: {intent_name}")
                 return jsonify({
                     "version": "1.0",
                     "response": {
                         "outputSpeech": {
                             "type": "PlainText",
-                            "text": "I'm not sure what you want to log. You can log a workout or a meal."
+                            "text": "I'm not sure how to help with that. You can say 'log a workout' or 'log a meal'."
                         },
                         "shouldEndSession": False
                     }
                 })
-        
-        # Handle any other request types
-        return jsonify({
-            "version": "1.0",
-            "response": {
-                "outputSpeech": {
-                    "type": "PlainText",
-                    "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
-                },
-                "reprompt": {
+                
+        # Handle launch requests
+        elif request_data.get('request', {}).get('type') == 'LaunchRequest':
+            print("Handling LaunchRequest")
+            return jsonify({
+                "version": "1.0",
+                "response": {
                     "outputSpeech": {
                         "type": "PlainText",
-                        "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
-                    }
-                },
-                "shouldEndSession": False
-            }
-        })
-    
+                        "text": f"Welcome to EleFit Tracker. You can say 'log a workout' or 'log a meal'."
+                    },
+                    "shouldEndSession": False
+                }
+            })
+            
+        # Handle session ended requests
+        elif request_data.get('request', {}).get('type') == 'SessionEndedRequest':
+            print("Handling SessionEndedRequest")
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "shouldEndSession": True
+                }
+            })
+            
+        # Unknown request type
+        else:
+            print(f"Unknown request type: {request_data.get('request', {}).get('type')}")
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "I'm not sure how to handle that request."
+                    },
+                    "shouldEndSession": True
+                }
+            })
+            
     except Exception as e:
         print(f"Error in alexa_auth_log: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return jsonify({
             "version": "1.0",
             "response": {
@@ -1266,6 +1258,232 @@ def privacy_redirect():
     """Redirect to the privacy policy page on the frontend."""
     frontend_url = get_frontend_url()
     return redirect(f"{frontend_url}/privacy")
+
+@app.route('/api/alexa/link-account', methods=['POST', 'OPTIONS'])
+def alexa_link_account():
+    """Handle Alexa account linking."""
+    # Handle CORS preflight request
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
+    
+    try:
+        # Verify authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            print("Missing or invalid authorization header")
+            return jsonify({'success': False, 'message': 'Missing or invalid authorization'}), 401
+        
+        # Extract the token
+        id_token = auth_header.split('Bearer ')[1]
+        
+        # Verify the token with Google (simplified for now)
+        token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={id_token}"
+        token_response = requests.get(token_info_url)
+        
+        if token_response.status_code != 200:
+            print(f"Invalid token: {token_response.text}")
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
+        
+        # Get user info from token
+        token_data = token_response.json()
+        user_email = token_data.get('email')
+        
+        if not user_email:
+            print("No email found in token data")
+            return jsonify({'success': False, 'message': 'User email not found in token'}), 401
+        
+        # Get the authorization code from the request
+        data = request.json
+        code = data.get('code')
+        redirect_uri = data.get('redirect_uri')
+        
+        if not code or not redirect_uri:
+            print("Missing code or redirect_uri in request")
+            return jsonify({'success': False, 'message': 'Missing code or redirect_uri'}), 400
+        
+        # Exchange code for tokens with Amazon
+        client_id = 'elefit-alexa-client'
+        client_secret = 'your-alexa-client-secret'  # In production, use environment variables
+        
+        # Prepare token exchange request
+        token_url = 'https://api.amazon.com/auth/o2/token'
+        payload = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'redirect_uri': redirect_uri
+        }
+        
+        # Make token exchange request to Amazon
+        token_exchange = requests.post(
+            token_url,
+            data=payload,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+        
+        if token_exchange.status_code != 200:
+            print(f"Token exchange failed: {token_exchange.text}")
+            return jsonify({
+                'success': False, 
+                'message': f'Amazon token exchange failed: {token_exchange.text}'
+            }), 400
+        
+        # Extract tokens from response
+        token_data = token_exchange.json()
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        
+        # Store tokens in Firestore if available
+        if FIREBASE_INITIALIZED and firestore_db:
+            user_ref = firestore_db.collection('users').document(user_email)
+            
+            # Update user document with Amazon tokens
+            user_ref.set({
+                'amazonTokens': {
+                    'accessToken': access_token,
+                    'refreshToken': refresh_token,
+                    'linked': True,
+                    'linkedAt': datetime.datetime.now().isoformat()
+                }
+            }, merge=True)
+            
+            print(f"Alexa account linked successfully for user: {user_email}")
+        else:
+            print("Firebase not initialized, skipping token storage")
+        
+        # Return success response
+        return jsonify({
+            'success': True,
+            'message': 'Account linked successfully'
+        })
+        
+    except Exception as e:
+        print(f"Error in Alexa account linking: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/alexa/check-link-status', methods=['GET'])
+def check_alexa_link_status():
+    """Check if the user has linked their Alexa account."""
+    try:
+        # Verify authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            print("Missing or invalid authorization header")
+            return jsonify({'success': False, 'message': 'Missing or invalid authorization'}), 401
+        
+        # Extract the token
+        id_token = auth_header.split('Bearer ')[1]
+        
+        # Verify the token with Google (simplified for now)
+        token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={id_token}"
+        token_response = requests.get(token_info_url)
+        
+        if token_response.status_code != 200:
+            print(f"Invalid token: {token_response.text}")
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
+        
+        # Get user info from token
+        token_data = token_response.json()
+        user_email = token_data.get('email')
+        
+        if not user_email:
+            print("No email found in token data")
+            return jsonify({'success': False, 'message': 'User email not found in token'}), 401
+        
+        # Check if the user has linked their Alexa account in Firestore
+        linked = False
+        if FIREBASE_INITIALIZED and firestore_db:
+            try:
+                user_ref = firestore_db.collection('users').document(user_email)
+                user_doc = user_ref.get()
+                
+                if user_doc.exists:
+                    amazon_tokens = user_doc.get('amazonTokens', {})
+                    linked = amazon_tokens.get('linked', False)
+                    
+                return jsonify({
+                    'success': True,
+                    'isLinked': linked
+                })
+            except Exception as e:
+                print(f"Error checking link status: {str(e)}")
+                return jsonify({'success': False, 'message': str(e)}), 500
+        else:
+            return jsonify({'success': True, 'isLinked': False})
+    
+    except Exception as e:
+        print(f"Error in check_alexa_link_status: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/alexa/unlink-account', methods=['POST', 'OPTIONS'])
+def unlink_alexa_account():
+    """Unlink a user's Alexa account."""
+    # Handle CORS preflight request
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
+    
+    try:
+        # Verify authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            print("Missing or invalid authorization header")
+            return jsonify({'success': False, 'message': 'Missing or invalid authorization'}), 401
+        
+        # Extract the token
+        id_token = auth_header.split('Bearer ')[1]
+        
+        # Verify the token with Google
+        token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={id_token}"
+        token_response = requests.get(token_info_url)
+        
+        if token_response.status_code != 200:
+            print(f"Invalid token: {token_response.text}")
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
+        
+        # Get user info from token
+        token_data = token_response.json()
+        user_email = token_data.get('email')
+        
+        if not user_email:
+            print("No email found in token data")
+            return jsonify({'success': False, 'message': 'User email not found in token'}), 401
+        
+        # Unlink the Alexa account in Firestore
+        if FIREBASE_INITIALIZED and firestore_db:
+            try:
+                user_ref = firestore_db.collection('users').document(user_email)
+                
+                # Remove Amazon tokens and set linked to false
+                user_ref.set({
+                    'amazonTokens': {
+                        'linked': False,
+                        'unlinkedAt': datetime.datetime.now().isoformat()
+                    }
+                }, merge=True)
+                
+                print(f"Alexa account unlinked successfully for user: {user_email}")
+                return jsonify({
+                    'success': True,
+                    'message': 'Account unlinked successfully'
+                })
+            except Exception as e:
+                print(f"Error unlinking account: {str(e)}")
+                return jsonify({'success': False, 'message': str(e)}), 500
+        else:
+            return jsonify({'success': True, 'message': 'Account unlinked successfully (Firebase not initialized)'})
+    
+    except Exception as e:
+        print(f"Error in unlink_alexa_account: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 # Run the app
 if __name__ == '__main__':
