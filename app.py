@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import os
 import json
@@ -15,6 +15,18 @@ CORS(app)  # Allow cross-origin requests
 
 # Set this to False to disable test mode (enables Firebase authentication)
 TEST_MODE = False
+
+# Configuration for frontend URLs
+LOCAL_FRONTEND_URL = 'http://localhost:5173'
+PRODUCTION_FRONTEND_URL = 'https://alexa-skill.netlify.app'
+
+# Get frontend URL based on environment
+def get_frontend_url():
+    # If running in production (on Render), use production URL
+    if os.environ.get('RENDER'):
+        return PRODUCTION_FRONTEND_URL
+    # Otherwise use local URL
+    return LOCAL_FRONTEND_URL
 
 # Add CORS headers to all responses
 @app.after_request
@@ -137,18 +149,30 @@ def sync_to_firestore(data, log_type):
 @app.route('/', methods=['GET'])
 def index():
     """Simple test endpoint to check if the server is running."""
+    frontend_url = get_frontend_url()
     return jsonify({
         'status': 'online',
         'message': 'EleFit Tracker API is running properly',
         'firebase_status': 'connected' if FIREBASE_INITIALIZED else 'disconnected',
         'test_mode': TEST_MODE,
+        'frontend_url': frontend_url,
         'endpoints': [
             '/api/log-workout',
             '/api/log-meal',
             '/api/workout-logs',
             '/api/meal-logs',
-            '/api/alexa/log'
+            '/api/alexa/log',
+            '/alexa/auth/log'
         ]
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for monitoring."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.datetime.now().isoformat(),
+        'firebase': FIREBASE_INITIALIZED
     })
 
 @app.route('/api/log-workout', methods=['POST'])
@@ -1136,6 +1160,13 @@ def alexa_auth_log():
                 "shouldEndSession": True
             }
         })
+
+# Redirect to frontend
+@app.route('/privacy', methods=['GET'])
+def privacy_redirect():
+    """Redirect to the privacy policy page on the frontend."""
+    frontend_url = get_frontend_url()
+    return redirect(f"{frontend_url}/privacy")
 
 # Run the app
 if __name__ == '__main__':
