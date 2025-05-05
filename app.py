@@ -929,11 +929,62 @@ def debug_alexa_workout():
 def alexa_auth_log():
     """Handle logging from Alexa with user authentication via Google OAuth."""
     try:
+        # Get the request data
+        request_data = request.json
+        print(f"Received Alexa request: {json.dumps(request_data, indent=2)}")
+        
+        # Handle LaunchRequest first (when skill is opened)
+        if request_data.get('request', {}).get('type') == 'LaunchRequest':
+            print("Handling LaunchRequest")
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
+                    },
+                    "reprompt": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
+                        }
+                    },
+                    "shouldEndSession": False
+                }
+            })
+        
+        # Handle SessionEndedRequest
+        elif request_data.get('request', {}).get('type') == 'SessionEndedRequest':
+            print("Handling SessionEndedRequest")
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "Goodbye!"
+                    },
+                    "shouldEndSession": True
+                }
+            })
+        
+        # For other request types, we need authentication
         # Get the authentication token from the request headers
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         if not token:
             print("Missing authorization token")
-            return jsonify({"error": "Missing authorization token"}), 401
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "Please link your Google account in the Alexa app to use this skill."
+                    },
+                    "card": {
+                        "type": "LinkAccount"
+                    },
+                    "shouldEndSession": True
+                }
+            })
             
         # Verify the token with Google
         token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?access_token={token}"
@@ -941,7 +992,19 @@ def alexa_auth_log():
         
         if token_response.status_code != 200:
             print(f"Invalid token: {token_response.text}")
-            return jsonify({"error": "Invalid token"}), 403
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "Your Google account link has expired. Please relink your account in the Alexa app."
+                    },
+                    "card": {
+                        "type": "LinkAccount"
+                    },
+                    "shouldEndSession": True
+                }
+            })
             
         # Extract user email from token info
         token_data = token_response.json()
@@ -949,16 +1012,24 @@ def alexa_auth_log():
         
         if not user_email:
             print("No email found in token data")
-            return jsonify({"error": "No email found in token data"}), 403
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "We couldn't find your email address. Please relink your account in the Alexa app."
+                    },
+                    "card": {
+                        "type": "LinkAccount"
+                    },
+                    "shouldEndSession": True
+                }
+            })
             
         print(f"Authenticated Alexa request for user: {user_email}")
         
-        # Get the request data
-        request_data = request.json
-        print(f"Received authenticated Alexa request: {json.dumps(request_data, indent=2)}")
-        
-        # Process the request based on the intent type
-        if 'request' in request_data and request_data.get('request', {}).get('type') == 'IntentRequest':
+        # Handle IntentRequests
+        if request_data.get('request', {}).get('type') == 'IntentRequest':
             intent_request = request_data.get('request', {})
             intent = intent_request.get('intent', {})
             intent_name = intent.get('name', '')
@@ -1114,6 +1185,34 @@ def alexa_auth_log():
                                 "shouldEndSession": True
                             }
                         })
+            elif intent_name == 'AMAZON.HelpIntent':
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "You can use EleFit Tracker to log your workouts and meals. Try saying 'log a running workout for 30 minutes' or 'log breakfast with eggs'."
+                        },
+                        "reprompt": {
+                            "outputSpeech": {
+                                "type": "PlainText",
+                                "text": "What would you like to log?"
+                            }
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+            elif intent_name in ['AMAZON.StopIntent', 'AMAZON.CancelIntent']:
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Goodbye!"
+                        },
+                        "shouldEndSession": True
+                    }
+                })
             else:
                 # Handle unknown intent
                 print(f"Unknown intent: {intent_name}")
@@ -1127,24 +1226,24 @@ def alexa_auth_log():
                         "shouldEndSession": False
                     }
                 })
-        else:
-            # Handle non-intent requests
-            return jsonify({
-                "version": "1.0",
-                "response": {
+        
+        # Handle any other request types
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
+                },
+                "reprompt": {
                     "outputSpeech": {
                         "type": "PlainText",
-                        "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
-                    },
-                    "reprompt": {
-                        "outputSpeech": {
-                            "type": "PlainText",
-                            "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
-                        }
-                    },
-                    "shouldEndSession": False
-                }
-            })
+                        "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
+                    }
+                },
+                "shouldEndSession": False
+            }
+        })
     
     except Exception as e:
         print(f"Error in alexa_auth_log: {str(e)}")
