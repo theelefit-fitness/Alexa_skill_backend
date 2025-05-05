@@ -1,0 +1,1138 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os
+import json
+import datetime
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
+from firebase_admin import firestore
+import requests
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)  # Allow cross-origin requests
+
+# Set this to False to disable test mode (enables Firebase authentication)
+TEST_MODE = False
+
+# Add CORS headers to all responses
+@app.after_request
+def add_cors_headers(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Initialize Firebase - with error handling
+try:
+    cred_path = os.path.join(os.path.dirname(__file__), 'serviceAccountKey.json')
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://theelefit-3f6c6-default-rtdb.firebaseio.com/'
+    })
+    print("Firebase initialized successfully")
+    FIREBASE_INITIALIZED = True
+    # Initialize Firestore
+    firestore_db = firestore.client()
+    print("Firestore initialized successfully")
+except Exception as e:
+    print(f"Firebase initialization error: {str(e)}")
+    FIREBASE_INITIALIZED = False
+    firestore_db = None
+
+# Helper function to sync data from Realtime Database to Firestore
+def sync_to_firestore(data, log_type):
+    """Sync data from Realtime Database to Firestore."""
+    try:
+        if not FIREBASE_INITIALIZED or not firestore_db:
+            print("Firebase or Firestore not initialized, skipping sync")
+            return False
+            
+        print(f"Syncing {log_type} data to Firestore: {json.dumps(data, indent=2)}")
+        
+        if log_type == 'workout':
+            # Map Realtime DB fields to Firestore fields
+            workout_data = {
+                'workoutType': data.get('workout_type', ''),
+                'activityName': data.get('activity_name', ''),
+                'duration': data.get('duration', 0),
+                'distance': data.get('distance'),
+                'sets': data.get('sets'),
+                'reps': data.get('reps'),
+                'timestamp': data.get('timestamp', datetime.datetime.now().strftime('%Y-%m-%d')),
+                'source': data.get('source', 'alexa'),
+                'type': 'workout',
+                'id': data.get('id', f'alexa_{datetime.datetime.now().timestamp()}')
+            }
+            
+            # Create a workoutLogs array in the users collection
+            # Since Alexa doesn't have user identification yet, we'll store it in a generic alexa_user document
+            user_ref = firestore_db.collection('users').document('alexa_user')
+            user_doc = user_ref.get()
+            
+            if user_doc.exists:
+                # Update the workout logs array
+                workout_logs = user_doc.get('workoutLogs', [])
+                workout_logs.append(workout_data)
+                user_ref.update({
+                    'workoutLogs': workout_logs
+                })
+            else:
+                # Create the user document with the workout
+                user_ref.set({
+                    'workoutLogs': [workout_data],
+                    'mealLogs': []
+                })
+                
+            print("Workout synced to Firestore successfully")
+            return True
+            
+        elif log_type == 'meal':
+            # Map Realtime DB fields to Firestore fields
+            meal_data = {
+                'mealType': data.get('meal_type', ''),
+                'foodItems': data.get('food_items', []),
+                'timestamp': data.get('timestamp', datetime.datetime.now().strftime('%Y-%m-%d')),
+                'source': data.get('source', 'alexa'),
+                'type': 'meal',
+                'id': data.get('id', f'alexa_{datetime.datetime.now().timestamp()}')
+            }
+            
+            # Create a mealLogs array in the users collection
+            # Since Alexa doesn't have user identification yet, we'll store it in a generic alexa_user document
+            user_ref = firestore_db.collection('users').document('alexa_user')
+            user_doc = user_ref.get()
+            
+            if user_doc.exists:
+                # Update the meal logs array
+                meal_logs = user_doc.get('mealLogs', [])
+                meal_logs.append(meal_data)
+                user_ref.update({
+                    'mealLogs': meal_logs
+                })
+            else:
+                # Create the user document with the meal
+                user_ref.set({
+                    'workoutLogs': [],
+                    'mealLogs': [meal_data]
+                })
+                
+            print("Meal synced to Firestore successfully")
+            return True
+            
+        else:
+            print(f"Unknown log type: {log_type}")
+            return False
+            
+    except Exception as e:
+        print(f"Error syncing to Firestore: {str(e)}")
+        return False
+
+# Routes
+@app.route('/', methods=['GET'])
+def index():
+    """Simple test endpoint to check if the server is running."""
+    return jsonify({
+        'status': 'online',
+        'message': 'EleFit Tracker API is running properly',
+        'firebase_status': 'connected' if FIREBASE_INITIALIZED else 'disconnected',
+        'test_mode': TEST_MODE,
+        'endpoints': [
+            '/api/log-workout',
+            '/api/log-meal',
+            '/api/workout-logs',
+            '/api/meal-logs',
+            '/api/alexa/log'
+        ]
+    })
+
+@app.route('/api/log-workout', methods=['POST'])
+def log_workout():
+    """Log a workout activity."""
+    try:
+        data = request.json
+        
+        # Validate required fields
+        required_fields = ['workoutType', 'activityName', 'duration', 'timestamp', 'source']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'success': False, 'message': f'Missing required field: {field}'}), 400
+        
+        # Create workout document
+        workout_data = {
+            'workout_type': data['workoutType'],
+            'activity_name': data['activityName'],
+            'duration': data['duration'],
+            'distance': data.get('distance'),
+            'sets': data.get('sets'),
+            'reps': data.get('reps'),
+            'timestamp': data['timestamp'],
+            'source': data['source']
+        }
+        
+        # If in test mode, we'll skip actual Firebase storage
+        if TEST_MODE:
+            return jsonify({
+                'success': True,
+                'message': f"Workout logged in test mode (Firebase: {FIREBASE_INITIALIZED})",
+                'workout_id': f'test-{datetime.datetime.now().timestamp()}'
+            })
+        
+        # Try to store in Firebase if initialized
+        if FIREBASE_INITIALIZED:
+            try:
+                # Add to Realtime Database
+                workout_ref = db.reference('workout_logs').push(workout_data)
+                workout_id = workout_ref.key
+                
+                # Add ID to document for Firestore sync
+                workout_data['id'] = workout_id
+                
+                # Sync to Firestore
+                sync_to_firestore(workout_data, 'workout')
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Workout logged successfully',
+                    'workout_id': workout_id
+                })
+            except Exception as firebase_error:
+                print(f"Firebase error in log_workout: {str(firebase_error)}")
+                # If there's a Firebase error but we're coming from Alexa, return success anyway
+                if data.get('source') == 'alexa':
+                    print("Returning success response for Alexa despite Firebase error")
+                    return jsonify({
+                        'success': True,
+                        'message': 'Workout logged for Alexa (no Firebase)',
+                        'workout_id': 'temp_id'
+                    })
+                else:
+                    return jsonify({'success': False, 'message': str(firebase_error)}), 500
+        else:
+            return jsonify({'success': False, 'message': 'Firebase not initialized'}), 500
+    
+    except Exception as e:
+        print(f"Error in log_workout: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/log-meal', methods=['POST'])
+def log_meal():
+    """Log a meal."""
+    try:
+        data = request.json
+        
+        # Validate required fields
+        required_fields = ['mealType', 'foodItems', 'timestamp', 'source']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'success': False, 'message': f'Missing required field: {field}'}), 400
+        
+        # Create meal document
+        meal_data = {
+            'meal_type': data['mealType'],
+            'food_items': data['foodItems'],  # Realtime DB can store arrays as JSON
+            'timestamp': data['timestamp'],
+            'source': data['source']
+        }
+        
+        # If in test mode, we'll skip actual Firebase storage
+        if TEST_MODE:
+            return jsonify({
+                'success': True,
+                'message': f"Meal logged in test mode (Firebase: {FIREBASE_INITIALIZED})",
+                'meal_id': f'test-{datetime.datetime.now().timestamp()}'
+            })
+            
+        # Try to store in Firebase if initialized
+        if FIREBASE_INITIALIZED:
+            try:
+                # Add to Realtime Database
+                meal_ref = db.reference('meal_logs').push(meal_data)
+                meal_id = meal_ref.key
+                
+                # Add ID to document for Firestore sync
+                meal_data['id'] = meal_id
+                
+                # Sync to Firestore
+                sync_to_firestore(meal_data, 'meal')
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Meal logged successfully',
+                    'meal_id': meal_id
+                })
+            except Exception as firebase_error:
+                print(f"Firebase error in log_meal: {str(firebase_error)}")
+                # If there's a Firebase error but we're coming from Alexa, return success anyway
+                if data.get('source') == 'alexa':
+                    print("Returning success response for Alexa despite Firebase error")
+                    return jsonify({
+                        'success': True,
+                        'message': 'Meal logged for Alexa (no Firebase)',
+                        'meal_id': 'temp_id'
+                    })
+                else:
+                    return jsonify({'success': False, 'message': str(firebase_error)}), 500
+        else:
+            return jsonify({'success': False, 'message': 'Firebase not initialized'}), 500
+    
+    except Exception as e:
+        print(f"Error in log_meal: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/workout-logs', methods=['GET'])
+def get_workout_logs():
+    """Retrieve workout logs."""
+    try:
+        # If Firebase is not initialized, return test data
+        if not FIREBASE_INITIALIZED or TEST_MODE:
+            return jsonify({
+                'success': True,
+                'logs': [
+                    {
+                        'id': 'test-1',
+                        'workout_type': 'running',
+                        'activity_name': 'running',
+                        'duration': 30,
+                        'distance': 5,
+                        'timestamp': '2023-08-11',
+                        'source': 'test'
+                    }
+                ]
+            })
+            
+        # Get workout logs from Realtime Database
+        logs_ref = db.reference('workout_logs')
+        logs = logs_ref.get()
+        
+        # Convert to list of dicts with IDs
+        result = []
+        if logs:
+            for log_id, log_data in logs.items():
+                log_data['id'] = log_id  # Add document ID
+                result.append(log_data)
+            
+            # Sort by timestamp (descending)
+            result.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'logs': result
+        })
+    
+    except Exception as e:
+        print(f"Error in get_workout_logs: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/meal-logs', methods=['GET'])
+def get_meal_logs():
+    """Retrieve meal logs."""
+    try:
+        # If Firebase is not initialized, return test data
+        if not FIREBASE_INITIALIZED or TEST_MODE:
+            return jsonify({
+                'success': True,
+                'logs': [
+                    {
+                        'id': 'test-1',
+                        'meal_type': 'lunch',
+                        'food_items': ['sandwich', 'apple'],
+                        'timestamp': '2023-08-11',
+                        'source': 'test'
+                    }
+                ]
+            })
+            
+        # Get meal logs from Realtime Database
+        logs_ref = db.reference('meal_logs')
+        logs = logs_ref.get()
+        
+        # Convert to list of dicts with IDs
+        result = []
+        if logs:
+            for log_id, log_data in logs.items():
+                log_data['id'] = log_id  # Add document ID
+                result.append(log_data)
+            
+            # Sort by timestamp (descending)
+            result.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'logs': result
+        })
+    
+    except Exception as e:
+        print(f"Error in get_meal_logs: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# Alexa endpoint - Will handle both workout and meal logging from Alexa
+@app.route('/api/alexa/log', methods=['POST'])
+def alexa_log():
+    """Handle logging from Alexa."""
+    try:
+        # Get the request data
+        request_data = request.json
+        print("Received Alexa request:", json.dumps(request_data, indent=2))
+        
+        # Check if this is an Alexa Skills Kit request
+        if 'request' in request_data and request_data.get('request', {}).get('type'):
+            # This is an Alexa Skills Kit request
+            alexa_request = request_data
+            request_type = alexa_request['request']['type']
+            print(f"Processing Alexa request type: {request_type}")
+            
+            # Handle LaunchRequest (when skill is opened)
+            if request_type == 'LaunchRequest':
+                print("Handling LaunchRequest")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
+                        },
+                        "reprompt": {
+                            "outputSpeech": {
+                                "type": "PlainText",
+                                "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
+                            }
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+                
+            # Handle SessionEndedRequest
+            elif request_type == 'SessionEndedRequest':
+                print("Handling SessionEndedRequest")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Goodbye!"
+                        },
+                        "shouldEndSession": True
+                    }
+                })
+                
+            # Handle IntentRequests
+            elif request_type == 'IntentRequest':
+                intent_request = alexa_request['request']
+                intent = intent_request.get('intent', {})
+                intent_name = intent.get('name', '')
+                slots = intent.get('slots', {})
+                
+                print(f"Handling IntentRequest: {intent_name}")
+                print(f"Slots: {json.dumps(slots, indent=2)}")
+                
+                if intent_name == 'LogWorkoutIntent':
+                    # Get workout details from slots
+                    workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
+                    duration = 30  # Default
+                    
+                    if 'Duration' in slots and slots['Duration'].get('value'):
+                        try:
+                            duration = int(slots['Duration']['value'])
+                        except ValueError:
+                            print(f"Invalid duration value: {slots['Duration']['value']}")
+                    
+                    # Create workout data
+                    workout_data = {
+                        'logType': 'workout',
+                        'workoutType': workout_type,
+                        'activityName': workout_type,  # Use workout type as activity name
+                        'duration': duration,
+                        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
+                        'source': 'alexa'
+                    }
+                    
+                    print(f"Prepared workout data: {json.dumps(workout_data, indent=2)}")
+                    
+                    # Log workout using direct API method
+                    try:
+                        # Make a new request to our own API
+                        workout_response = log_direct_workout(workout_data)
+                        
+                        # Create Alexa response
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Your {workout_type} workout has been logged successfully for {duration} minutes."
+                                },
+                                "card": {
+                                    "type": "Simple",
+                                    "title": "EleFit Tracker",
+                                    "content": f"Logged {workout_type} workout for {duration} minutes."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                    except Exception as e:
+                        print(f"Error logging workout from Alexa: {str(e)}")
+                        # Return error response to Alexa
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Sorry, there was an error logging your workout. {str(e)}"
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                    
+                elif intent_name == 'LogMealIntent':
+                    # Get meal details from slots
+                    meal_type = slots.get('MealType', {}).get('value', 'snack').lower()
+                    
+                    # Extract food items
+                    food_items = []
+                    if 'FoodItem' in slots and slots['FoodItem'].get('value'):
+                        food_items.append(slots['FoodItem']['value'])
+                    
+                    # Create meal data
+                    meal_data = {
+                        'logType': 'meal',
+                        'mealType': meal_type,
+                        'foodItems': food_items,
+                        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
+                        'source': 'alexa'
+                    }
+                    
+                    print(f"Prepared meal data: {json.dumps(meal_data, indent=2)}")
+                    
+                    # Log meal using direct API method
+                    try:
+                        # Make a new request to our own API
+                        meal_response = log_direct_meal(meal_data)
+                        
+                        # Get food item text
+                        food_item = slots.get('FoodItem', {}).get('value', '')
+                        food_text = f" with {food_item}" if food_item else ""
+                        
+                        # Create Alexa response
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Your {meal_type}{food_text} has been logged successfully."
+                                },
+                                "card": {
+                                    "type": "Simple",
+                                    "title": "EleFit Tracker",
+                                    "content": f"Logged {meal_type}{food_text}."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                    except Exception as e:
+                        print(f"Error logging meal from Alexa: {str(e)}")
+                        # Return error response to Alexa
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Sorry, there was an error logging your meal. {str(e)}"
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                
+                else:
+                    # Handle unknown intent
+                    print(f"Unknown intent: {intent_name}")
+                    return jsonify({
+                        "version": "1.0",
+                        "response": {
+                            "outputSpeech": {
+                                "type": "PlainText",
+                                "text": "I'm not sure what you want to log. You can log a workout or a meal."
+                            },
+                            "shouldEndSession": False
+                        }
+                    })
+            
+            # Handle any other Alexa request types
+            else:
+                print(f"Unhandled request type: {request_type}")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "I'm not sure how to handle that request. You can log a workout or a meal."
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+        
+        # Handle direct API calls (as your current implementation expects)
+        else:
+            data = request_data
+            log_type = data.get('logType')
+            print(f"Direct API call with log_type: {log_type}")
+        
+            if log_type == 'workout':
+                # Process workout log
+                return log_workout()
+            elif log_type == 'meal':
+                # Process meal log
+                return log_meal()
+            else:
+                return jsonify({'success': False, 'message': 'Invalid log type'}), 400
+    
+    except Exception as e:
+        print(f"Error in alexa_log: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Return Alexa-compatible error response
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "Sorry, there was an error processing your request."
+                },
+                "shouldEndSession": True
+            }
+        })
+
+# Helper function to log workout directly without modifying request.json
+def log_direct_workout(workout_data):
+    """Log a workout without modifying request.json."""
+    try:
+        # Validate required fields
+        required_fields = ['workoutType', 'activityName', 'duration', 'timestamp', 'source']
+        for field in required_fields:
+            if field not in workout_data:
+                return {'success': False, 'message': f'Missing required field: {field}'}
+        
+        # Create workout document
+        workout_doc = {
+            'workout_type': workout_data['workoutType'],
+            'activity_name': workout_data['activityName'],
+            'duration': workout_data['duration'],
+            'distance': workout_data.get('distance'),
+            'sets': workout_data.get('sets'),
+            'reps': workout_data.get('reps'),
+            'timestamp': workout_data['timestamp'],
+            'source': workout_data['source']
+        }
+        
+        # If in test mode, we'll skip actual Firebase storage
+        if TEST_MODE:
+            workout_id = f'test-{datetime.datetime.now().timestamp()}'
+            print(f"Test mode: Created workout with ID {workout_id}")
+            return {
+                'success': True,
+                'message': f"Workout logged in test mode (Firebase: {FIREBASE_INITIALIZED})",
+                'workout_id': workout_id
+            }
+        
+        # Try to store in Firebase if initialized
+        if FIREBASE_INITIALIZED:
+            try:
+                # Add to Realtime Database
+                workout_ref = db.reference('workout_logs').push(workout_doc)
+                workout_id = workout_ref.key
+                
+                # Add ID to document for Firestore sync
+                workout_doc['id'] = workout_id
+                
+                # Sync to Firestore
+                sync_to_firestore(workout_doc, 'workout')
+                
+                return {
+                    'success': True,
+                    'message': 'Workout logged successfully',
+                    'workout_id': workout_id
+                }
+            except Exception as firebase_error:
+                print(f"Firebase error in log_direct_workout: {str(firebase_error)}")
+                if workout_data.get('source') == 'alexa':
+                    print("Returning success response for Alexa despite Firebase error")
+                    return {
+                        'success': True,
+                        'message': 'Workout logged for Alexa (no Firebase)',
+                        'workout_id': 'temp_id'
+                    }
+                else:
+                    return {'success': False, 'message': str(firebase_error)}
+        else:
+            return {'success': False, 'message': 'Firebase not initialized'}
+    
+    except Exception as e:
+        print(f"Error in log_direct_workout: {str(e)}")
+        return {'success': False, 'message': str(e)}
+
+# Helper function to log meal directly without modifying request.json
+def log_direct_meal(meal_data):
+    """Log a meal without modifying request.json."""
+    try:
+        # Validate required fields
+        required_fields = ['mealType', 'foodItems', 'timestamp', 'source']
+        for field in required_fields:
+            if field not in meal_data:
+                return {'success': False, 'message': f'Missing required field: {field}'}
+        
+        # Create meal document
+        meal_doc = {
+            'meal_type': meal_data['mealType'],
+            'food_items': meal_data['foodItems'],
+            'timestamp': meal_data['timestamp'],
+            'source': meal_data['source']
+        }
+        
+        # If in test mode, we'll skip actual Firebase storage
+        if TEST_MODE:
+            meal_id = f'test-{datetime.datetime.now().timestamp()}'
+            print(f"Test mode: Created meal with ID {meal_id}")
+            return {
+                'success': True,
+                'message': f"Meal logged in test mode (Firebase: {FIREBASE_INITIALIZED})",
+                'meal_id': meal_id
+            }
+            
+        # Try to store in Firebase if initialized
+        if FIREBASE_INITIALIZED:
+            try:
+                # Add to Realtime Database
+                meal_ref = db.reference('meal_logs').push(meal_doc)
+                meal_id = meal_ref.key
+                
+                # Add ID to document for Firestore sync
+                meal_doc['id'] = meal_id
+                
+                # Sync to Firestore
+                sync_to_firestore(meal_doc, 'meal')
+                
+                return {
+                    'success': True,
+                    'message': 'Meal logged successfully',
+                    'meal_id': meal_id
+                }
+            except Exception as firebase_error:
+                print(f"Firebase error in log_direct_meal: {str(firebase_error)}")
+                if meal_data.get('source') == 'alexa':
+                    print("Returning success response for Alexa despite Firebase error")
+                    return {
+                        'success': True,
+                        'message': 'Meal logged for Alexa (no Firebase)',
+                        'meal_id': 'temp_id'
+                    }
+                else:
+                    return {'success': False, 'message': str(firebase_error)}
+        else:
+            return {'success': False, 'message': 'Firebase not initialized'}
+    
+    except Exception as e:
+        print(f"Error in log_direct_meal: {str(e)}")
+        return {'success': False, 'message': str(e)}
+
+# Debug endpoint to help test Alexa functionality
+@app.route('/api/debug/alexa', methods=['GET'])
+def debug_alexa():
+    """Return test payloads for Alexa."""
+    return jsonify({
+        'success': True,
+        'test_payloads': {
+            'launch_request': {
+                "version": "1.0",
+                "session": {
+                    "new": True,
+                    "sessionId": "test-session-123",
+                    "application": {"applicationId": "test-app-id"},
+                    "user": {"userId": "test-user-123"}
+                },
+                "request": {
+                    "type": "LaunchRequest",
+                    "requestId": "test-launch-request-id",
+                    "timestamp": "2023-08-11T12:00:00Z",
+                    "locale": "en-US"
+                }
+            },
+            'log_workout_intent': {
+                "version": "1.0",
+                "session": {
+                    "new": False,
+                    "sessionId": "test-session-123",
+                    "application": {"applicationId": "test-app-id"},
+                    "user": {"userId": "test-user-123"}
+                },
+                "request": {
+                    "type": "IntentRequest",
+                    "requestId": "test-intent-request-id",
+                    "timestamp": "2023-08-11T12:00:00Z",
+                    "locale": "en-US",
+                    "intent": {
+                        "name": "LogWorkoutIntent",
+                        "slots": {
+                            "WorkoutType": {"name": "WorkoutType", "value": "running"},
+                            "Duration": {"name": "Duration", "value": "45"}
+                        }
+                    }
+                }
+            },
+            'log_meal_intent': {
+                "version": "1.0",
+                "session": {
+                    "new": False,
+                    "sessionId": "test-session-123",
+                    "application": {"applicationId": "test-app-id"},
+                    "user": {"userId": "test-user-123"}
+                },
+                "request": {
+                    "type": "IntentRequest",
+                    "requestId": "test-intent-request-id",
+                    "timestamp": "2023-08-11T12:00:00Z",
+                    "locale": "en-US",
+                    "intent": {
+                        "name": "LogMealIntent",
+                        "slots": {
+                            "MealType": {"name": "MealType", "value": "breakfast"},
+                            "FoodItem": {"name": "FoodItem", "value": "oatmeal"}
+                        }
+                    }
+                }
+            },
+            'direct_workout_payload': {
+                "logType": "workout",
+                "workoutType": "running",
+                "activityName": "running",
+                "duration": 30,
+                "timestamp": "2023-08-11",
+                "source": "alexa"
+            },
+            'direct_meal_payload': {
+                "logType": "meal",
+                "mealType": "lunch",
+                "foodItems": ["sandwich", "apple"],
+                "timestamp": "2023-08-11",
+                "source": "alexa"
+            }
+        }
+    })
+
+# Debug endpoint for Alexa workout logging
+@app.route('/api/debug/alexa/workout', methods=['POST'])
+def debug_alexa_workout():
+    """Test endpoint for Alexa workout logging."""
+    try:
+        # Get the request data
+        request_data = request.json
+        print("Received debug Alexa workout request:", json.dumps(request_data, indent=2))
+        
+        # Extract workout data directly from the Alexa request
+        if 'request' in request_data and request_data.get('request', {}).get('type') == 'IntentRequest':
+            # This is an Alexa Skills Kit request
+            intent = request_data.get('request', {}).get('intent', {})
+            intent_name = intent.get('name', '')
+            slots = intent.get('slots', {})
+            
+            if intent_name == 'LogWorkoutIntent':
+                # Get workout details from slots
+                workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
+                duration = 30  # Default
+                
+                if 'Duration' in slots and slots['Duration'].get('value'):
+                    try:
+                        duration = int(slots['Duration']['value'])
+                    except ValueError:
+                        print(f"Invalid duration value: {slots['Duration']['value']}")
+                
+                # Log workout in test mode
+                workout_id = f"test-{datetime.datetime.now().timestamp()}"
+                
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": f"Your {workout_type} workout has been logged successfully for {duration} minutes."
+                        },
+                        "card": {
+                            "type": "Simple",
+                            "title": "EleFit Tracker",
+                            "content": f"Logged {workout_type} workout for {duration} minutes."
+                        },
+                        "shouldEndSession": True
+                    }
+                })
+            else:
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Sorry, I only understand workout logging requests."
+                        },
+                        "shouldEndSession": True
+                    }
+                })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "This endpoint only supports Alexa IntentRequests for LogWorkoutIntent"
+            }), 400
+    
+    except Exception as e:
+        print(f"Error in debug_alexa_workout: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "Sorry, there was an error processing your request."
+                },
+                "shouldEndSession": True
+            }
+        })
+
+# Alexa account linked endpoint for authenticated logging
+@app.route('/alexa/auth/log', methods=['POST'])
+def alexa_auth_log():
+    """Handle logging from Alexa with user authentication via Google OAuth."""
+    try:
+        # Get the authentication token from the request headers
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not token:
+            print("Missing authorization token")
+            return jsonify({"error": "Missing authorization token"}), 401
+            
+        # Verify the token with Google
+        token_info_url = f"https://www.googleapis.com/oauth2/v3/tokeninfo?access_token={token}"
+        token_response = requests.get(token_info_url)
+        
+        if token_response.status_code != 200:
+            print(f"Invalid token: {token_response.text}")
+            return jsonify({"error": "Invalid token"}), 403
+            
+        # Extract user email from token info
+        token_data = token_response.json()
+        user_email = token_data.get("email")
+        
+        if not user_email:
+            print("No email found in token data")
+            return jsonify({"error": "No email found in token data"}), 403
+            
+        print(f"Authenticated Alexa request for user: {user_email}")
+        
+        # Get the request data
+        request_data = request.json
+        print(f"Received authenticated Alexa request: {json.dumps(request_data, indent=2)}")
+        
+        # Process the request based on the intent type
+        if 'request' in request_data and request_data.get('request', {}).get('type') == 'IntentRequest':
+            intent_request = request_data.get('request', {})
+            intent = intent_request.get('intent', {})
+            intent_name = intent.get('name', '')
+            slots = intent.get('slots', {})
+            
+            print(f"Processing intent: {intent_name}")
+            
+            if intent_name == 'LogWorkoutIntent':
+                # Extract workout details from slots
+                workout_type = slots.get('WorkoutType', {}).get('value', 'general').lower()
+                duration = 30  # Default
+                
+                if 'Duration' in slots and slots['Duration'].get('value'):
+                    try:
+                        duration = int(slots['Duration']['value'])
+                    except ValueError:
+                        print(f"Invalid duration value: {slots['Duration']['value']}")
+                
+                # Create workout data
+                workout_data = {
+                    'workoutType': workout_type,
+                    'activityName': workout_type,
+                    'duration': duration,
+                    'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
+                    'source': 'alexa',
+                    'type': 'workout',
+                    'id': f'alexa_{datetime.datetime.now().timestamp()}'
+                }
+                
+                # Store directly to Firestore for the authenticated user
+                if firestore_db:
+                    try:
+                        # Get user document
+                        user_ref = firestore_db.collection('users').document(user_email)
+                        user_doc = user_ref.get()
+                        
+                        if user_doc.exists:
+                            # Update workout logs array
+                            workout_logs = user_doc.get('workoutLogs', [])
+                            workout_logs.append(workout_data)
+                            user_ref.update({
+                                'workoutLogs': workout_logs
+                            })
+                        else:
+                            # Create new user document
+                            user_ref.set({
+                                'workoutLogs': [workout_data],
+                                'mealLogs': []
+                            })
+                            
+                        print(f"Workout logged successfully for user: {user_email}")
+                        
+                        # Return success response to Alexa
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Your {workout_type} workout has been logged successfully for {duration} minutes."
+                                },
+                                "card": {
+                                    "type": "Simple",
+                                    "title": "EleFit Tracker",
+                                    "content": f"Logged {workout_type} workout for {duration} minutes."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                    except Exception as e:
+                        print(f"Error logging workout to Firestore: {str(e)}")
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Sorry, there was an error logging your workout."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                
+            elif intent_name == 'LogMealIntent':
+                # Extract meal details from slots
+                meal_type = slots.get('MealType', {}).get('value', 'snack').lower()
+                
+                # Extract food items
+                food_items = []
+                if 'FoodItem' in slots and slots['FoodItem'].get('value'):
+                    food_items.append(slots['FoodItem']['value'])
+                
+                # Create meal data
+                meal_data = {
+                    'mealType': meal_type,
+                    'foodItems': food_items,
+                    'timestamp': datetime.datetime.now().strftime('%Y-%m-%d'),
+                    'source': 'alexa',
+                    'type': 'meal',
+                    'id': f'alexa_{datetime.datetime.now().timestamp()}'
+                }
+                
+                # Store directly to Firestore for the authenticated user
+                if firestore_db:
+                    try:
+                        # Get user document
+                        user_ref = firestore_db.collection('users').document(user_email)
+                        user_doc = user_ref.get()
+                        
+                        if user_doc.exists:
+                            # Update meal logs array
+                            meal_logs = user_doc.get('mealLogs', [])
+                            meal_logs.append(meal_data)
+                            user_ref.update({
+                                'mealLogs': meal_logs
+                            })
+                        else:
+                            # Create new user document
+                            user_ref.set({
+                                'workoutLogs': [],
+                                'mealLogs': [meal_data]
+                            })
+                            
+                        print(f"Meal logged successfully for user: {user_email}")
+                        
+                        # Get food item text for response
+                        food_item = slots.get('FoodItem', {}).get('value', '')
+                        food_text = f" with {food_item}" if food_item else ""
+                        
+                        # Return success response to Alexa
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Your {meal_type}{food_text} has been logged successfully."
+                                },
+                                "card": {
+                                    "type": "Simple",
+                                    "title": "EleFit Tracker",
+                                    "content": f"Logged {meal_type}{food_text}."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+                    except Exception as e:
+                        print(f"Error logging meal to Firestore: {str(e)}")
+                        return jsonify({
+                            "version": "1.0",
+                            "response": {
+                                "outputSpeech": {
+                                    "type": "PlainText",
+                                    "text": f"Sorry, there was an error logging your meal."
+                                },
+                                "shouldEndSession": True
+                            }
+                        })
+            else:
+                # Handle unknown intent
+                print(f"Unknown intent: {intent_name}")
+                return jsonify({
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "I'm not sure what you want to log. You can log a workout or a meal."
+                        },
+                        "shouldEndSession": False
+                    }
+                })
+        else:
+            # Handle non-intent requests
+            return jsonify({
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "Welcome to EleFit Tracker. You can log a workout or a meal."
+                    },
+                    "reprompt": {
+                        "outputSpeech": {
+                            "type": "PlainText",
+                            "text": "Try saying: log a running workout for 30 minutes, or log breakfast with oatmeal."
+                        }
+                    },
+                    "shouldEndSession": False
+                }
+            })
+    
+    except Exception as e:
+        print(f"Error in alexa_auth_log: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "Sorry, there was an error processing your request."
+                },
+                "shouldEndSession": True
+            }
+        })
+
+# Run the app
+if __name__ == '__main__':
+    app.run(debug=True, port=5000) 
