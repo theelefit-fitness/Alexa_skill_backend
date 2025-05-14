@@ -16,6 +16,16 @@ from google.auth.transport import requests as google_requests
 app = Flask(__name__)
 CORS(app)  # Allow cross-origin requests
 
+ALLOWED_ORIGINS = [
+    'http://localhost:5173',  # Local development
+    'https://alexa-skill.netlify.app',  # Your Netlify app
+    'https://elefit-backend.onrender.com',  # Your backend
+    'https://*.myshopify.com',  # Shopify stores
+]
+
+
+CORS(app, resources={r"/chat": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
 # Set this to False to disable test mode (enables Firebase authentication)
 TEST_MODE = False
 
